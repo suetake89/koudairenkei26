@@ -798,9 +798,6 @@ def main() -> None:
         st.subheader("現在の数式")
         render_current_model_formulas(enabled)
 
-        st.subheader("依存関係")
-        render_dependency_table(enabled)
-
         with st.expander("現在の主要パラメータ"):
             parameter_rows = []
             if "required_study" in enabled:
