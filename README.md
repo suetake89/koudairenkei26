@@ -117,44 +117,7 @@ streamlit run app.py
 - 科目と科目別最低時間を入れる
 - 現在のモデルの数式を確認する
 
-## Colab向け最小版
-
-`colab_basic_model.py` は、Streamlit UI なしで、定式化と小さな PuLP 実行だけを扱う教材用ファイルです。
-
-```python
-from colab_basic_model import StudyParams, solve_basic_model, current_model_formulas
-
-params = StudyParams(
-    unit_minutes=30,
-    days=1,
-    min_study_slots=4,
-    max_study_slots=8,
-)
-
-result, status = solve_basic_model(params)
-result
-```
-
-数式を確認する場合：
-
-```python
-current_model_formulas(include_week=False)
-```
-
-7日間モデルまで見る場合：
-
-```python
-current_model_formulas(include_week=True)
-```
-
-科目を発展として見る場合：
-
-```python
-current_model_formulas(include_week=True, include_subjects=True)
-```
-
 ## 補足
 
 Streamlit アプリ本体は `app.py` です。
 
-Colab教材用の最小版は `colab_basic_model.py` です。
