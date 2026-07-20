@@ -1,0 +1,13 @@
+[project]
+name = "koudairenkei26-study-planner"
+version = "0.1.0"
+description = "Streamlit app for visualizing and optimizing a study planning model."
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0",
+    "pulp>=2.8",
+    "streamlit>=1.36",
+]
+
+[tool.uv]
+package = false
