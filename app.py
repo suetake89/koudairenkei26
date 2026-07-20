@@ -463,16 +463,34 @@ def current_model_formulas(enabled: set[str]) -> list[tuple[str, list[FormulaLin
     execution_notes: list[tuple[str, list[FormulaLine]]] = []
     if has_motivation:
         execution_notes.append((
-            "実行上の数式の補足",
+            "実行上の数式の補足1",
             [
                 (rf"{w}={m}{z}\quad({idx})", "PuLPではこの掛け算を直接使わず、以下の3つの線形制約に分割する。"),
-                (rf"{w}\le {m}\quad({idx})", "1つ目の線形制約。"),
-                (rf"{w}\le 100{z}\quad({idx})", "勉強しない時間は評価値が0になるようにする。"),
-                (rf"{w}\ge {m}-100(1-{z})\quad({idx})", "勉強する時間は評価値がモチベーションと一致するようにする。"),
-                (rf"{next_m}\le 100", "モチベーションの上限を100にする。"),
+                (
+                    rf"{w}\le {m}\quad({idx})",
+                    rf"{z}=0 のときは強い制限にならない。{z}=1 のときは評価値がモチベーションを超えないようにする。",
+                ),
+                (
+                    rf"{w}\le 100{z}\quad({idx})",
+                    rf"{z}=0 のとき {w}\le0 なので、{w}\ge0 と合わせて {w}=0 になる。{z}=1 のときは {w}\le100 だけになる。",
+                ),
+                (
+                    rf"{w}\ge {m}-100(1-{z})\quad({idx})",
+                    rf"{z}=0 のときは強い制限にならない。{z}=1 のとき {w}\ge {m} となり、{w}\le {m} と合わせて {w}={m} になる。",
+                ),
+            ],
+        ))
+        execution_notes.append((
+            "実行上の数式の補足2",
+            [
+                (
+                    rf"{next_m}\le\min\{{100,\ {m}-a{z}+b{r_var}+{g}\}}",
+                    "PuLPではこのminを直接使わず、以下の2つの上限制約に分割する。",
+                ),
+                (rf"{next_m}\le 100", "1つ目の上限制約。モチベーションの上限を100にする。"),
                 (
                     rf"{next_m}\le {m}-a{z}+b{r_var}+{g}",
-                    rf"{next_m}\le\min\{{100,\ {m}-a{z}+b{r_var}+{g}\}} をPuLPで扱える形にしたもの。",
+                    "2つ目の上限制約。勉強・休憩・固定予定後の回復による変化を表す。",
                 ),
             ],
         ))
