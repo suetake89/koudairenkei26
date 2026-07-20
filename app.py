@@ -583,9 +583,9 @@ def render_dependency_table(enabled: set[str]) -> None:
     st.dataframe(pd.DataFrame(records), hide_index=True, width="stretch")
 
 
-def fixed_grid_to_dataframe(fixed_grid: list[list[bool]], slot_minutes: int) -> pd.DataFrame:
+def fixed_grid_to_dataframe(fixed_grid: list[list[bool]], slot_minutes: int, days_to_show: int) -> pd.DataFrame:
     rows = []
-    for day_index, row in enumerate(fixed_grid):
+    for day_index, row in enumerate(fixed_grid[:days_to_show]):
         record = {"曜日": WEEKDAYS[day_index]}
         for slot, is_fixed in enumerate(row):
             record[slot_to_time(slot, slot_minutes)] = is_fixed
@@ -593,9 +593,12 @@ def fixed_grid_to_dataframe(fixed_grid: list[list[bool]], slot_minutes: int) -> 
     return pd.DataFrame(rows)
 
 
-def dataframe_to_fixed_grid(df: pd.DataFrame, slot_minutes: int) -> list[list[bool]]:
+def dataframe_to_fixed_grid(df: pd.DataFrame, slot_minutes: int, current_grid: list[list[bool]]) -> list[list[bool]]:
     time_columns = [slot_to_time(slot, slot_minutes) for slot in range(slots_per_day(slot_minutes))]
-    return [[bool(row[col]) for col in time_columns] for _, row in df.iterrows()]
+    updated = [row[:] for row in current_grid]
+    for day_index, (_, row) in enumerate(df.iterrows()):
+        updated[day_index] = [bool(row[col]) for col in time_columns]
+    return updated
 
 
 def apply_fixed_range(
@@ -605,6 +608,7 @@ def apply_fixed_range(
     start_label: str,
     end_label: str,
     value: bool,
+    days_to_show: int,
 ) -> list[list[bool]]:
     updated = [row[:] for row in fixed_grid]
     time_labels = [slot_to_time(slot, slot_minutes) for slot in range(slots_per_day(slot_minutes) + 1)]
@@ -613,23 +617,24 @@ def apply_fixed_range(
     if end_slot <= start_slot:
         return updated
 
-    day_indices = range(DAYS_PER_WEEK) if day_label == "全曜日" else [WEEKDAYS.index(day_label)]
+    day_indices = range(days_to_show) if day_label == "全曜日" else [WEEKDAYS.index(day_label)]
     for day_index in day_indices:
         for slot in range(start_slot, min(end_slot, len(updated[day_index]))):
             updated[day_index][slot] = value
     return updated
 
 
-def render_fixed_time_editor(slot_minutes: int) -> tuple[list[list[bool]], dict[str, int]]:
+def render_fixed_time_editor(slot_minutes: int, days_to_show: int) -> tuple[list[list[bool]], dict[str, int]]:
     grid_key = f"fixed_grid_{slot_minutes}"
     if grid_key not in st.session_state:
         st.session_state[grid_key] = default_fixed_grid(slot_minutes)
 
     st.subheader("範囲指定でまとめて変更")
     time_labels = [slot_to_time(slot, slot_minutes) for slot in range(slots_per_day(slot_minutes) + 1)]
+    day_options = ["全曜日", *WEEKDAYS[:days_to_show]]
     with st.form(f"fixed_range_form_{slot_minutes}"):
         col_day, col_start, col_end, col_action = st.columns(4)
-        day_label = col_day.selectbox("曜日", ["全曜日", *WEEKDAYS], key=f"range_day_{slot_minutes}")
+        day_label = col_day.selectbox("曜日", day_options, key=f"range_day_{slot_minutes}")
         start_label = col_start.selectbox("開始", time_labels[:-1], key=f"range_start_{slot_minutes}")
         end_label = col_end.selectbox("終了", time_labels[1:], index=min(2, len(time_labels) - 2), key=f"range_end_{slot_minutes}")
         action = col_action.selectbox("操作", ["固定にする", "固定を外す"], key=f"range_action_{slot_minutes}")
@@ -643,13 +648,14 @@ def render_fixed_time_editor(slot_minutes: int) -> tuple[list[list[bool]], dict[
             start_label,
             end_label,
             action == "固定にする",
+            days_to_show,
         )
         st.rerun()
 
     st.caption("固定予定にしたいマスをチェックし、最後に「固定時間を反映」を押してください。")
     with st.form(f"fixed_time_form_{slot_minutes}"):
         edited = st.data_editor(
-            fixed_grid_to_dataframe(st.session_state[grid_key], slot_minutes),
+            fixed_grid_to_dataframe(st.session_state[grid_key], slot_minutes, days_to_show),
             hide_index=True,
             disabled=["曜日"],
             width="stretch",
@@ -658,7 +664,7 @@ def render_fixed_time_editor(slot_minutes: int) -> tuple[list[list[bool]], dict[
         submitted = st.form_submit_button("固定時間を反映")
 
     if submitted:
-        st.session_state[grid_key] = dataframe_to_fixed_grid(edited, slot_minutes)
+        st.session_state[grid_key] = dataframe_to_fixed_grid(edited, slot_minutes, st.session_state[grid_key])
         st.rerun()
 
     if st.button("標準の固定予定に戻す", key=f"reset_fixed_{slot_minutes}"):
@@ -667,7 +673,7 @@ def render_fixed_time_editor(slot_minutes: int) -> tuple[list[list[bool]], dict[
 
     fixed_grid = st.session_state[grid_key]
 
-    blocks = detect_fixed_blocks(fixed_grid, slot_minutes)
+    blocks = [block for block in detect_fixed_blocks(fixed_grid, slot_minutes) if block["day"] < days_to_show]
     st.subheader("固定予定ブロックごとの回復量")
     if not blocks:
         st.caption("固定予定ブロックはありません。")
@@ -799,7 +805,8 @@ def main() -> None:
 
     tab_plan, tab_fixed = st.tabs(["勉強計画", "固定時間"])
     with tab_fixed:
-        fixed_grid, block_recoveries = render_fixed_time_editor(slot_minutes)
+        fixed_days_to_show = DAYS_PER_WEEK if "week" in enabled else 1
+        fixed_grid, block_recoveries = render_fixed_time_editor(slot_minutes, fixed_days_to_show)
 
     params["fixed_grid"] = fixed_grid
     params["block_recoveries"] = block_recoveries
