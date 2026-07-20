@@ -460,7 +460,23 @@ def current_model_formulas(enabled: set[str]) -> list[tuple[str, list[FormulaLin
             ],
         ))
 
-    return [("変数", variables), ("目的関数", objective), *constraints]
+    execution_notes: list[tuple[str, list[FormulaLine]]] = []
+    if has_motivation:
+        execution_notes.append((
+            "実行上の数式の補足",
+            [
+                (rf"{w}\le {m}\quad({idx})", rf"PuLPでは {w}={m}{z} の掛け算を直接使わないため、線形制約で表す。"),
+                (rf"{w}\le 100{z}\quad({idx})", "勉強しない時間は評価値が0になるようにする。"),
+                (rf"{w}\ge {m}-100(1-{z})\quad({idx})", "勉強する時間は評価値がモチベーションと一致するようにする。"),
+                (rf"{next_m}\le 100", "モチベーションの上限を100にする。"),
+                (
+                    rf"{next_m}\le {m}-a{z}+b{r_var}+{g}",
+                    rf"{next_m}\le\min\{{100,\ {m}-a{z}+b{r_var}+{g}\}} をPuLPで扱える形にしたもの。",
+                ),
+            ],
+        ))
+
+    return [("変数", variables), ("目的関数", objective), *constraints, *execution_notes]
 
 
 def render_current_model_formulas(enabled: set[str]) -> None:
