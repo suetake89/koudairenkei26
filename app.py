@@ -466,13 +466,14 @@ def current_model_formulas(enabled: set[str]) -> list[tuple[str, list[FormulaLin
             "実行上の数式の補足1",
             [
                 (rf"{w}={m}{z}\quad({idx})", "PuLPではこの掛け算を直接使わず、以下の3つの線形制約に分割する。"),
+                (rf"0\le {w}\quad({idx})", "評価値は負にならないようにする。"),
                 (
                     rf"{w}\le {m}\quad({idx})",
                     rf"{z}=0 のときは強い制限にならない。{z}=1 のときは評価値がモチベーションを超えないようにする。",
                 ),
                 (
                     rf"{w}\le 100{z}\quad({idx})",
-                    rf"{z}=0 のとき {w}\le0 なので、{w}\ge0 と合わせて {w}=0 になる。{z}=1 のときは {w}\le100 だけになる。",
+                    rf"{z}=0 のとき {w}\le0 なので、0\le {w} と合わせて {w}=0 になる。{z}=1 のときは {w}\le100 だけになる。",
                 ),
                 (
                     rf"{w}\ge {m}-100(1-{z})\quad({idx})",
