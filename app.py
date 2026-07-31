@@ -796,7 +796,7 @@ def main() -> None:
         unit_label = st.selectbox("勉強単位", list(UNIT_OPTIONS.keys()), index=1)
         slot_minutes = UNIT_OPTIONS[unit_label]
         default_h_min = max(1, 12 * 60 // slot_minutes)
-        default_h_max = max(default_h_min, 20 * 60 // slot_minutes)
+        default_h_max = 1000
         h_min = 0
         h_max = slots_per_day(slot_minutes) * DAYS_PER_WEEK
         if "required_study" in enabled:
