@@ -117,14 +117,17 @@ FORMULA_BLOCKS = {
     "subjects": FormulaBlock(
         key="subjects",
         priority=5,
-        label="科目・科目別最低時間",
+        label="科目・科目別最低時間・連続勉強",
         requires=("week",),
-        description="勉強する時間に5科目のうち1つを割り当て、科目ごとの最低勉強時間を満たす。",
+        description="科目ごとの最低勉強時間とモチベーション低下量を設定し、連続勉強中は同じ科目に絞る。",
         formulas=(
             r"K=\{\text{数学},\text{英語},\text{国語},\text{理科},\text{社会}\}",
             r"X_{dtj}\in\{0,1\}\quad(d\in D,t\in T,j\in K)",
             r"\sum_{j\in K}X_{dtj}=Z_{dt}\quad(d\in D,t\in T)",
             r"\sum_{d\in D}\sum_{t\in T}X_{dtj}\ge H_j\quad(j\in K)",
+            r"a_j\ge0\quad(j\in K)",
+            r"M_{d,t+1}=\min\left\{100,\ M_{dt}-\sum_{j\in K}a_jX_{dtj}+bR_{dt}+G_{dt}\right\}",
+            r"X_{dtj}-X_{d,t+1,j}\le2-Z_{dt}-Z_{d,t+1}",
         ),
     ),
 }
@@ -291,8 +294,23 @@ def solve_schedule(enabled: set[str], params: dict[str, float]) -> tuple[list[di
 
             recoveries = recovery_slots(d, params, enabled)
             for t in range(slots - 1):
-                raw = m[d][t] - params["a"] * z[d][t] + params["b"] * r[d][t] + recoveries.get(t, 0)
+                if x is not None:
+                    motivation_decrease = pulp.lpSum(
+                        params["subject_a"][subject] * x[d][t][subject]
+                        for subject in SUBJECTS
+                    )
+                else:
+                    motivation_decrease = params["a"] * z[d][t]
+                raw = m[d][t] - motivation_decrease + params["b"] * r[d][t] + recoveries.get(t, 0)
                 model += m[d][t + 1] <= raw
+
+        if x is not None:
+            for t in range(slots - 1):
+                for subject in SUBJECTS:
+                    model += (
+                        x[d][t][subject] - x[d][t + 1][subject]
+                        <= 2 - z[d][t] - z[d][t + 1]
+                    )
 
     max_available = sum(slots - len(fixed_slots(d, slot_minutes, params)) for d in range(days))
     if "required_study" in enabled and params["h_min"] > max_available:
@@ -403,6 +421,11 @@ def current_model_formulas(enabled: set[str]) -> list[tuple[str, list[FormulaLin
     next_m = "M_{d,t+1}" if is_week else "M_{t+1}"
     sum_t_z = r"\sum_{d\in D}\sum_{t\in T}Z_{dt}" if is_week else r"\sum_{t\in T}Z_t"
     sum_t_w = r"\sum_{d\in D}\sum_{t\in T}W_{dt}" if is_week else r"\sum_{t\in T}W_t"
+    motivation_decrease = (
+        r"\sum_{j\in K}a_jX_{dtj}"
+        if has_subjects
+        else rf"a{z}"
+    )
 
     variables: list[FormulaLine] = [
         (time_set, "計画で使う日と時刻の範囲。"),
@@ -418,6 +441,7 @@ def current_model_formulas(enabled: set[str]) -> list[tuple[str, list[FormulaLin
         variables.extend([
             (r"K=\{\text{国語},\text{英語},\text{数学},\text{社会},\text{理科}\}", "扱う科目の集合。"),
             (r"X_{dtj}\in\{0,1\}\quad(d\in D,\ t\in T,\ j\in K)", "その時間に科目jを勉強するなら1。"),
+            (r"a_j\ge0\quad(j\in K)", "科目jを1コマ勉強したときのモチベーション低下量。"),
         ])
 
     objective = [
@@ -442,7 +466,12 @@ def current_model_formulas(enabled: set[str]) -> list[tuple[str, list[FormulaLin
             "制約3：モチベーション",
             [
                 (initial, "最初のモチベーションを100から始める。"),
-                (rf"{next_m}=\min\{{100,\ {m}-a{z}+b{r_var}+{g}\}}", "勉強で下がり、休憩や固定予定後の回復で上がる。"),
+                (
+                    rf"{next_m}=\min\{{100,\ {m}-{motivation_decrease}+b{r_var}+{g}\}}",
+                    "勉強科目に応じて下がり、休憩や固定予定後の回復で上がる。"
+                    if has_subjects
+                    else "勉強で下がり、休憩や固定予定後の回復で上がる。",
+                ),
                 (rf"{w}={m}{z}\quad({idx})", "勉強しない時間の評価は0、勉強する時間はモチベーション分だけ評価する。"),
             ],
         ))
@@ -453,10 +482,14 @@ def current_model_formulas(enabled: set[str]) -> list[tuple[str, list[FormulaLin
         ))
     if has_subjects:
         constraints.append((
-            "制約5：科目・科目別最低時間",
+            "制約5：科目・科目別最低時間・連続勉強",
             [
                 (r"\sum_{j\in K}X_{dtj}=Z_{dt}\quad(d\in D,\ t\in T)", "勉強する時間には、必ず1つの科目を選ぶ。"),
                 (r"\sum_{d\in D}\sum_{t\in T}X_{dtj}\ge H_j\quad(j\in K)", "各科目で最低限必要な勉強コマ数を満たす。"),
+                (
+                    r"X_{dtj}-X_{d,t+1,j}\le2-Z_{dt}-Z_{d,t+1}\quad(d\in D,\ t<|T|,\ j\in K)",
+                    "連続する2コマがどちらも勉強なら科目を一致させる。科目を変えるには休憩または固定予定を挟む。",
+                ),
             ],
         ))
 
@@ -485,12 +518,12 @@ def current_model_formulas(enabled: set[str]) -> list[tuple[str, list[FormulaLin
             "実行上の数式の補足2",
             [
                 (
-                    rf"{next_m}\le\min\{{100,\ {m}-a{z}+b{r_var}+{g}\}}",
+                    rf"{next_m}\le\min\{{100,\ {m}-{motivation_decrease}+b{r_var}+{g}\}}",
                     "PuLPではこのminを直接使わず、以下の2つの上限制約に分割する。",
                 ),
                 (rf"{next_m}\le 100", "1つ目の上限制約。モチベーションの上限を100にする。"),
                 (
-                    rf"{next_m}\le {m}-a{z}+b{r_var}+{g}",
+                    rf"{next_m}\le {m}-{motivation_decrease}+b{r_var}+{g}",
                     "2つ目の上限制約。勉強・休憩・固定予定後の回復による変化を表す。",
                 ),
             ],
@@ -750,7 +783,10 @@ def main() -> None:
             if not raw_enabled["week"]:
                 reset_steps_after("week")
         if raw_enabled.get("week", False):
-            raw_enabled["subjects"] = st.toggle("5. 科目・科目別最低時間", key="toggle_subjects")
+            raw_enabled["subjects"] = st.toggle(
+                "5. 科目・科目別最低時間・連続勉強",
+                key="toggle_subjects",
+            )
             if not raw_enabled["subjects"]:
                 reset_steps_after("subjects")
 
@@ -788,10 +824,22 @@ def main() -> None:
             "b": 30,
             "time_limit": 10,
             "subject_hours": {subject: 4 for subject in SUBJECTS},
+            "subject_a": {subject: 20 for subject in SUBJECTS},
         }
 
         if "motivation" in enabled:
-            params["a"] = st.number_input("勉強による低下 a", min_value=0, value=20, step=5)
+            if "subjects" in enabled:
+                st.caption("科目別モチベーション低下量")
+                for subject in SUBJECTS:
+                    params["subject_a"][subject] = st.number_input(
+                        f"{subject}を1コマ勉強したときの低下量 a_j",
+                        min_value=0,
+                        value=20,
+                        step=5,
+                        key=f"subject_a_{subject}",
+                    )
+            else:
+                params["a"] = st.number_input("勉強による低下 a", min_value=0, value=20, step=5)
             params["b"] = st.number_input("休憩による回復 b", min_value=0, value=30, step=5)
             st.caption("固定予定後の回復量 G_dt は「固定時間」タブで、連続ブロックごとに設定します。")
 
@@ -846,10 +894,18 @@ def main() -> None:
             if "required_study" in enabled:
                 parameter_rows.append({"項目": "最低勉強コマ数", "記号": "H^{min}", "値": f"{h_min} コマ"})
                 parameter_rows.append({"項目": "最大勉強コマ数", "記号": "H^{max}", "値": f"{h_max} コマ"})
-            parameter_rows.extend([
-                {"項目": "勉強による低下", "記号": "a", "値": params["a"]},
-                {"項目": "休憩による回復", "記号": "b", "値": params["b"]},
-            ])
+            if "subjects" in enabled:
+                for subject in SUBJECTS:
+                    parameter_rows.append(
+                        {
+                            "項目": f"{subject}を1コマ勉強したときの低下量",
+                            "記号": f"a_{{{subject}}}",
+                            "値": params["subject_a"][subject],
+                        }
+                    )
+            else:
+                parameter_rows.append({"項目": "勉強による低下", "記号": "a", "値": params["a"]})
+            parameter_rows.append({"項目": "休憩による回復", "記号": "b", "値": params["b"]})
             if "subjects" in enabled:
                 for subject in SUBJECTS:
                     parameter_rows.append(
