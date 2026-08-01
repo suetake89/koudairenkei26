@@ -121,3 +121,25 @@ streamlit run app.py
 
 Streamlit アプリ本体は `app.py` です。
 
+## 固定時間をSupabaseへ保存する
+
+固定時間は `day`（7日間化OFF）と `week`（7日間化ON）ごとに、次の5設定を保存できます。
+
+- 部活なし
+- 部活あり
+- デフォルト３
+- デフォルト４
+- デフォルト５
+
+1. Supabaseでプロジェクトを作成します。
+2. SQL Editorで `supabase_schema.sql` を実行します。
+3. `.streamlit/secrets.toml.example` を `.streamlit/secrets.toml` としてコピーし、SupabaseのProject URLとSecret key（`sb_secret_...`）を設定します。
+4. Streamlit Community Cloudでは、アプリのSettings → Secretsに同じ内容を登録します。
+
+Secret keyはサーバー専用の秘密情報です。GitHubへコミットしたり、ブラウザ側へ渡したりしないでください。保存済み設定は、アプリ起動時や設定切替時にDBから自動で読み込まれます。固定時間をまとめてチェックして「変更をまとめて反映」を押してから、「この設定をDBへ保存」を操作します。旧`service_role` keyにも対応しています。
+
+### cloneした全員で同じDBを使う場合
+
+`supabase_public.json` にProject URLとPublishable key（`sb_publishable_...`）を設定してGitHubへコミットします。Publishable keyは公開可能ですが、`supabase_schema.sql`の匿名RLS設定により、誰でも固定時間を読み込み・上書きできる運用になります。行の削除権限はありません。
+
+ローカルの`.streamlit/secrets.toml`が存在する場合は、そちらの接続情報を優先します。Secret keyは引き続きGitHubへコミットしないでください。

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import streamlit as st
@@ -25,6 +30,7 @@ UNIT_OPTIONS = {
     "5分": 5,
 }
 SUBJECTS = ["国語", "英語", "数学", "社会", "理科"]
+FIXED_SCHEDULE_PROFILES = ["部活なし", "部活あり", "デフォルト３", "デフォルト４", "デフォルト５"]
 SUBJECT_CLASS = {
     "数学": "subj-math",
     "英語": "subj-english",
@@ -97,8 +103,11 @@ FORMULA_BLOCKS = {
         formulas=(
             r"M_t\in[0,100]",
             r"M_1=100",
-            r"M_{t+1}=\min\{100,\ M_t-aZ_t+bR_t+G_t\}",
-            r"W_t=M_tZ_t",
+            r"V_t=M_t-aZ_t+bR_t+G_t",
+            r"V_t-\Omega Q_t\le M_{t+1}\le V_t",
+            r"100-\Omega(1-Q_t)\le M_{t+1}\le100,\quad Q_t\in\{0,1\}",
+            r"W_t\le\Omega Z_t,\quad W_t\ge-\Omega Z_t",
+            r"W_t\le M_t+\Omega(1-Z_t),\quad W_t\ge M_t-\Omega(1-Z_t)",
             r"\max\sum_{t\in T}W_t",
         ),
     ),
@@ -153,6 +162,104 @@ def default_fixed_grid(slot_minutes: int) -> list[list[bool]]:
         for slot in default_fixed_slots(day_index, slot_minutes):
             grid[day_index][slot] = True
     return grid
+
+
+def fixed_schedule_state_keys(mode: str, profile: str, slot_minutes: int) -> tuple[str, str]:
+    suffix = f"{mode}_{profile}_{slot_minutes}"
+    return f"fixed_grid_{suffix}", f"block_recoveries_{suffix}"
+
+
+def clear_fixed_editor_widget_state(mode: str, profile: str, slot_minutes: int) -> None:
+    suffix = f"{mode}_{profile}_{slot_minutes}"
+    exact_keys = {f"fixed_editor_{suffix}"}
+    recovery_prefix = f"recovery_input_{suffix}_"
+    for key in list(st.session_state):
+        if key in exact_keys or key.startswith(recovery_prefix):
+            del st.session_state[key]
+
+
+def supabase_config() -> tuple[str, str] | None:
+    try:
+        section = st.secrets["supabase"]
+        url = str(section["url"]).rstrip("/")
+        key = str(section["key"])
+    except (FileNotFoundError, KeyError):
+        public_config_path = Path(__file__).with_name("supabase_public.json")
+        if not public_config_path.exists():
+            return None
+        with public_config_path.open(encoding="utf-8") as config_file:
+            section = json.load(config_file).get("supabase", {})
+        url = str(section.get("url", "")).rstrip("/")
+        key = str(section.get("key", ""))
+        if not url or not key or "YOUR_" in url or "YOUR_" in key:
+            return None
+    return url, key
+
+
+def supabase_request(
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    prefer: str | None = None,
+) -> object:
+    config = supabase_config()
+    if config is None:
+        raise RuntimeError("Supabase接続情報が設定されていません。")
+    url, key = config
+    headers = {
+        "apikey": key,
+        "Content-Type": "application/json",
+    }
+    # Legacy JWT keys require Bearer authentication. New sb_secret_ and
+    # sb_publishable_ keys authenticate through the apikey header alone.
+    if not key.startswith("sb_"):
+        headers["Authorization"] = f"Bearer {key}"
+    if prefer:
+        headers["Prefer"] = prefer
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = Request(f"{url}/rest/v1/{path}", data=body, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=10) as response:
+            content = response.read()
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Supabaseエラー（{error.code}）: {detail}") from error
+    except URLError as error:
+        raise RuntimeError(f"Supabaseに接続できません: {error.reason}") from error
+    return json.loads(content) if content else None
+
+
+def load_fixed_schedule(mode: str, profile: str) -> dict | None:
+    query = urlencode({
+        "mode": f"eq.{mode}",
+        "profile": f"eq.{profile}",
+        "select": "slot_minutes,fixed_grid,block_recoveries,updated_at",
+        "limit": "1",
+    })
+    rows = supabase_request("GET", f"fixed_schedule?{query}")
+    return rows[0] if isinstance(rows, list) and rows else None
+
+
+def save_fixed_schedule(
+    mode: str,
+    profile: str,
+    slot_minutes: int,
+    fixed_grid: list[list[bool]],
+    block_recoveries: dict[str, int],
+) -> None:
+    payload = {
+        "mode": mode,
+        "profile": profile,
+        "slot_minutes": slot_minutes,
+        "fixed_grid": fixed_grid,
+        "block_recoveries": block_recoveries,
+    }
+    supabase_request(
+        "POST",
+        "fixed_schedule?on_conflict=mode,profile",
+        payload,
+        "resolution=merge-duplicates,return=minimal",
+    )
 
 
 def default_fixed_slots(day_index: int, slot_minutes: int) -> set[int]:
@@ -267,10 +374,24 @@ def solve_schedule(enabled: set[str], params: dict[str, float]) -> tuple[list[di
     z = pulp.LpVariable.dicts("Z", (range(days), range(slots)), 0, 1, cat="Binary")
     r = pulp.LpVariable.dicts("R", (range(days), range(slots)), 0, 1, cat="Binary")
 
-    m = w = None
+    m = w = v = q = None
+    omega = None
     if "motivation" in enabled:
+        max_decrease = (
+            max(params["subject_a"].values())
+            if "subjects" in enabled
+            else params["a"]
+        )
+        max_recovery = max(
+            [0, *(params.get("block_recoveries") or {}).values()]
+        )
+        # V is in [-max_decrease, 100 + b + max_recovery].  This value is
+        # large enough for both min(100, V) and W = MZ linearizations.
+        omega = max(100, 100 + max_decrease, params["b"] + max_recovery)
         m = pulp.LpVariable.dicts("M", (range(days), range(slots)), 0, 100, cat="Continuous")
-        w = pulp.LpVariable.dicts("W", (range(days), range(slots)), 0, 100, cat="Continuous")
+        w = pulp.LpVariable.dicts("W", (range(days), range(slots)), cat="Continuous")
+        v = pulp.LpVariable.dicts("V", (range(days), range(slots - 1)), cat="Continuous")
+        q = pulp.LpVariable.dicts("Q", (range(days), range(slots - 1)), 0, 1, cat="Binary")
     x = None
     if "subjects" in enabled:
         x = pulp.LpVariable.dicts("X", (range(days), range(slots), SUBJECTS), 0, 1, cat="Binary")
@@ -285,9 +406,10 @@ def solve_schedule(enabled: set[str], params: dict[str, float]) -> tuple[list[di
                 model += pulp.lpSum(x[d][t][j] for j in SUBJECTS) == z[d][t]
 
             if w is not None and m is not None:
-                model += w[d][t] <= m[d][t]
-                model += w[d][t] <= 100 * z[d][t]
-                model += w[d][t] >= m[d][t] - 100 * (1 - z[d][t])
+                model += w[d][t] <= omega * z[d][t]
+                model += w[d][t] >= -omega * z[d][t]
+                model += w[d][t] <= m[d][t] + omega * (1 - z[d][t])
+                model += w[d][t] >= m[d][t] - omega * (1 - z[d][t])
 
         if m is not None:
             model += m[d][0] == 100
@@ -301,8 +423,16 @@ def solve_schedule(enabled: set[str], params: dict[str, float]) -> tuple[list[di
                     )
                 else:
                     motivation_decrease = params["a"] * z[d][t]
-                raw = m[d][t] - motivation_decrease + params["b"] * r[d][t] + recoveries.get(t, 0)
-                model += m[d][t + 1] <= raw
+                model += v[d][t] == (
+                    m[d][t]
+                    - motivation_decrease
+                    + params["b"] * r[d][t]
+                    + recoveries.get(t, 0)
+                )
+                model += m[d][t + 1] >= v[d][t] - omega * q[d][t]
+                model += m[d][t + 1] <= v[d][t]
+                model += m[d][t + 1] >= 100 - omega * (1 - q[d][t])
+                model += m[d][t + 1] <= 100
 
         if x is not None:
             for t in range(slots - 1):
@@ -435,7 +565,9 @@ def current_model_formulas(enabled: set[str]) -> list[tuple[str, list[FormulaLin
     if has_motivation:
         variables.extend([
             (rf"{m}\in[0,100]\quad({idx})", "その時間のモチベーション。"),
-            (rf"{w}\ge0\quad({idx})", "モチベーションを考慮した勉強の評価値。"),
+            (rf"{w}\in\mathbb{{R}}\quad({idx})", "モチベーションを考慮した勉強の評価値。"),
+            (r"Q_{dt}\in\{0,1\}" if is_week else r"Q_t\in\{0,1\}", "上限100を適用するかを表す補助変数。"),
+            (r"\Omega>0", "線形化に用いる、十分大きなBig-M定数。"),
         ])
     if has_subjects:
         variables.extend([
@@ -496,35 +628,33 @@ def current_model_formulas(enabled: set[str]) -> list[tuple[str, list[FormulaLin
     execution_notes: list[tuple[str, list[FormulaLine]]] = []
     if has_motivation:
         execution_notes.append((
-            "実行上の数式の補足1",
+            "補足 (1)：上限100をもつモチベーション更新の線形化",
             [
-                (rf"{w}={m}{z}\quad({idx})", "PuLPではこの掛け算を直接使わず、以下の3つの線形制約に分割する。"),
-                (rf"0\le {w}\quad({idx})", "評価値は負にならないようにする。"),
+                (rf"V_{{{'dt' if is_week else 't'}}}={m}-{motivation_decrease}+b{r_var}+{g}", "まず、上限100を適用する前のモチベーションをVと置く。"),
                 (
-                    rf"{w}\le {m}\quad({idx})",
-                    rf"{z}=0 のときは強い制限にならない。{z}=1 のときは評価値がモチベーションを超えないようにする。",
+                    rf"V_{{{'dt' if is_week else 't'}}}-\Omega Q_{{{'dt' if is_week else 't'}}}\le {next_m}\le V_{{{'dt' if is_week else 't'}}}",
+                    "Q=0なら、モチベーション更新値をVに一致させる。",
                 ),
                 (
-                    rf"{w}\le 100{z}\quad({idx})",
-                    rf"{z}=0 のとき {w} ≤ 0 なので、0 ≤ {w} と合わせて {w}=0 になる。{z}=1 のときは {w} ≤ 100 だけになる。",
+                    rf"100-\Omega(1-Q_{{{'dt' if is_week else 't'}}})\le {next_m}\le100",
+                    "Q=1なら、モチベーション更新値を100に一致させる。",
                 ),
-                (
-                    rf"{w}\ge {m}-100(1-{z})\quad({idx})",
-                    rf"{z}=0 のときは強い制限にならない。{z}=1 のとき {w} ≥ {m} となり、{w} ≤ {m} と合わせて {w}={m} になる。",
-                ),
+                (rf"Q_{{{'dt' if is_week else 't'}}}\in\{{0,1\}}", "V<100ならQ=0、V>100ならQ=1となる。V=100ではどちらでもよく、Mの更新値は常に min{100,V} になる。"),
             ],
         ))
         execution_notes.append((
-            "実行上の数式の補足2",
+            "補足 (2)：モチベーションと勉強変数の積の線形化",
             [
+                (rf"{w}={m}{z}\quad({idx})", "積を直接使わず、次の4本のBig-M制約に置き換える。"),
+                (rf"{w}\le\Omega {z}\quad({idx})", "Z=0のとき、Wの上限を0にする。"),
+                (rf"{w}\ge-\Omega {z}\quad({idx})", "Z=0のとき、Wの下限を0にする。"),
                 (
-                    rf"{next_m}\le\min\{{100,\ {m}-{motivation_decrease}+b{r_var}+{g}\}}",
-                    "PuLPではこのminを直接使わず、以下の2つの上限制約に分割する。",
+                    rf"{w}\le {m}+\Omega(1-{z})\quad({idx})",
+                    "Z=1のとき、Wの上限をMにする。",
                 ),
-                (rf"{next_m}\le 100", "1つ目の上限制約。モチベーションの上限を100にする。"),
                 (
-                    rf"{next_m}\le {m}-{motivation_decrease}+b{r_var}+{g}",
-                    "2つ目の上限制約。勉強・休憩・固定予定後の回復による変化を表す。",
+                    rf"{w}\ge {m}-\Omega(1-{z})\quad({idx})",
+                    "Z=1のとき、Wの下限をMにする。したがって、Z=0ならW=0、Z=1ならW=Mとなる。",
                 ),
             ],
         ))
@@ -657,20 +787,26 @@ def apply_fixed_range(
     return updated
 
 
-def render_fixed_time_editor(slot_minutes: int, days_to_show: int) -> tuple[list[list[bool]], dict[str, int]]:
-    grid_key = f"fixed_grid_{slot_minutes}"
+def render_fixed_time_editor(
+    slot_minutes: int,
+    days_to_show: int,
+    mode: str,
+    profile: str,
+) -> tuple[list[list[bool]], dict[str, int]]:
+    grid_key, recovery_state_key = fixed_schedule_state_keys(mode, profile, slot_minutes)
+    widget_suffix = f"{mode}_{profile}_{slot_minutes}"
     if grid_key not in st.session_state:
         st.session_state[grid_key] = default_fixed_grid(slot_minutes)
 
     st.subheader("範囲指定でまとめて変更")
     time_labels = [slot_to_time(slot, slot_minutes) for slot in range(slots_per_day(slot_minutes) + 1)]
     day_options = ["全曜日", *WEEKDAYS[:days_to_show]]
-    with st.form(f"fixed_range_form_{slot_minutes}"):
+    with st.form(f"fixed_range_form_{widget_suffix}"):
         col_day, col_start, col_end, col_action = st.columns(4)
-        day_label = col_day.selectbox("曜日", day_options, key=f"range_day_{slot_minutes}")
-        start_label = col_start.selectbox("開始", time_labels[:-1], key=f"range_start_{slot_minutes}")
-        end_label = col_end.selectbox("終了", time_labels[1:], index=min(2, len(time_labels) - 2), key=f"range_end_{slot_minutes}")
-        action = col_action.selectbox("操作", ["固定にする", "固定を外す"], key=f"range_action_{slot_minutes}")
+        day_label = col_day.selectbox("曜日", day_options, key=f"range_day_{widget_suffix}")
+        start_label = col_start.selectbox("開始", time_labels[:-1], key=f"range_start_{widget_suffix}")
+        end_label = col_end.selectbox("終了", time_labels[1:], index=min(2, len(time_labels) - 2), key=f"range_end_{widget_suffix}")
+        action = col_action.selectbox("操作", ["固定にする", "固定を外す"], key=f"range_action_{widget_suffix}")
         range_submitted = st.form_submit_button("範囲を反映")
 
     if range_submitted:
@@ -683,25 +819,30 @@ def render_fixed_time_editor(slot_minutes: int, days_to_show: int) -> tuple[list
             action == "固定にする",
             days_to_show,
         )
-        st.rerun()
+        clear_fixed_editor_widget_state(mode, profile, slot_minutes)
 
-    st.caption("固定予定にしたいマスをチェックし、最後に「固定時間を反映」を押してください。")
-    with st.form(f"fixed_time_form_{slot_minutes}"):
+    st.caption("固定予定にしたいマスをまとめてチェックし、最後に「変更をまとめて反映」を押してください。チェック中はリロードされません。")
+    with st.form(f"fixed_time_form_{widget_suffix}"):
         edited = st.data_editor(
             fixed_grid_to_dataframe(st.session_state[grid_key], slot_minutes, days_to_show),
             hide_index=True,
             disabled=["曜日"],
             width="stretch",
-            key=f"fixed_editor_{slot_minutes}",
+            key=f"fixed_editor_{widget_suffix}",
         )
-        submitted = st.form_submit_button("固定時間を反映")
+        fixed_time_submitted = st.form_submit_button("変更をまとめて反映")
 
-    if submitted:
-        st.session_state[grid_key] = dataframe_to_fixed_grid(edited, slot_minutes, st.session_state[grid_key])
-        st.rerun()
+    if fixed_time_submitted:
+        st.session_state[grid_key] = dataframe_to_fixed_grid(
+            edited,
+            slot_minutes,
+            st.session_state[grid_key],
+        )
 
-    if st.button("標準の固定予定に戻す", key=f"reset_fixed_{slot_minutes}"):
+    if st.button("標準の固定予定に戻す", key=f"reset_fixed_{widget_suffix}"):
         st.session_state[grid_key] = default_fixed_grid(slot_minutes)
+        st.session_state[recovery_state_key] = {}
+        clear_fixed_editor_widget_state(mode, profile, slot_minutes)
         st.rerun()
 
     fixed_grid = st.session_state[grid_key]
@@ -711,11 +852,10 @@ def render_fixed_time_editor(slot_minutes: int, days_to_show: int) -> tuple[list
     if not blocks:
         st.caption("固定予定ブロックはありません。")
 
-    recovery_state_key = f"block_recoveries_{slot_minutes}"
     if recovery_state_key not in st.session_state:
         st.session_state[recovery_state_key] = {}
 
-    with st.form(f"recovery_form_{slot_minutes}"):
+    with st.form(f"recovery_form_{widget_suffix}"):
         draft_recoveries = {}
         for block in blocks:
             default = st.session_state[recovery_state_key].get(block["id"], 0)
@@ -724,13 +864,12 @@ def render_fixed_time_editor(slot_minutes: int, days_to_show: int) -> tuple[list
                 min_value=0,
                 value=int(default),
                 step=5,
-                key=f"recovery_input_{block['id']}",
+                key=f"recovery_input_{widget_suffix}_{block['id']}",
             )
         recovery_submitted = st.form_submit_button("回復量を反映")
 
     if recovery_submitted:
         st.session_state[recovery_state_key] = draft_recoveries
-        st.rerun()
 
     recoveries = {
         block["id"]: st.session_state[recovery_state_key].get(block["id"], 0)
@@ -854,7 +993,113 @@ def main() -> None:
     tab_plan, tab_fixed = st.tabs(["勉強計画", "固定時間"])
     with tab_fixed:
         fixed_days_to_show = DAYS_PER_WEEK if "week" in enabled else 1
-        fixed_grid, block_recoveries = render_fixed_time_editor(slot_minutes, fixed_days_to_show)
+        fixed_mode = "week" if "week" in enabled else "day"
+        st.subheader("保存する固定時間")
+        st.caption(f"現在の区分：{'7日間用（week）' if fixed_mode == 'week' else '1日用（day）'}")
+        fixed_profile = st.selectbox(
+            "固定時間の設定",
+            FIXED_SCHEDULE_PROFILES,
+            key=f"fixed_profile_{fixed_mode}",
+        )
+        auto_load_key = f"fixed_schedule_auto_loaded_{fixed_mode}_{fixed_profile}_{slot_minutes}"
+        if supabase_config() is not None and auto_load_key not in st.session_state:
+            try:
+                saved = load_fixed_schedule(fixed_mode, fixed_profile)
+                if saved is None:
+                    st.session_state[auto_load_key] = "not_found"
+                elif int(saved["slot_minutes"]) != slot_minutes:
+                    st.session_state[auto_load_key] = f"unit_mismatch:{saved['slot_minutes']}"
+                else:
+                    loaded_grid = saved["fixed_grid"]
+                    if len(loaded_grid) != DAYS_PER_WEEK or any(
+                        len(row) != slots_per_day(slot_minutes) for row in loaded_grid
+                    ):
+                        raise RuntimeError("保存データの固定時間形式が現在の設定と一致しません。")
+                    grid_key, recovery_key = fixed_schedule_state_keys(
+                        fixed_mode, fixed_profile, slot_minutes
+                    )
+                    st.session_state[grid_key] = loaded_grid
+                    st.session_state[recovery_key] = saved.get("block_recoveries") or {}
+                    clear_fixed_editor_widget_state(fixed_mode, fixed_profile, slot_minutes)
+                    st.session_state[auto_load_key] = "loaded"
+            except RuntimeError as error:
+                st.session_state[auto_load_key] = f"error:{error}"
+
+        auto_load_status = st.session_state.get(auto_load_key)
+        if auto_load_status == "loaded":
+            st.caption("保存済みの固定時間をDBから自動で読み込みました。")
+        elif auto_load_status == "not_found":
+            st.caption("この設定には保存データがないため、標準値を表示しています。")
+        elif isinstance(auto_load_status, str) and auto_load_status.startswith("unit_mismatch:"):
+            saved_unit = auto_load_status.split(":", 1)[1]
+            st.warning(
+                f"この設定は{saved_unit}分単位で保存されています。"
+                f" サイドバーを{saved_unit}分単位にすると自動で読み込みます。"
+            )
+        elif isinstance(auto_load_status, str) and auto_load_status.startswith("error:"):
+            st.error(auto_load_status.split(":", 1)[1])
+
+        fixed_grid, block_recoveries = render_fixed_time_editor(
+            slot_minutes,
+            fixed_days_to_show,
+            fixed_mode,
+            fixed_profile,
+        )
+
+        st.subheader("外部データベース")
+        if supabase_config() is None:
+            st.info("Supabase接続情報をStreamlit Secretsに登録すると、半永久保存を利用できます。")
+        save_col, load_col = st.columns(2)
+        if save_col.button(
+            "この設定をDBへ保存",
+            type="primary",
+            disabled=supabase_config() is None,
+            key=f"save_fixed_{fixed_mode}_{fixed_profile}_{slot_minutes}",
+        ):
+            try:
+                save_fixed_schedule(
+                    fixed_mode,
+                    fixed_profile,
+                    slot_minutes,
+                    fixed_grid,
+                    block_recoveries,
+                )
+            except RuntimeError as error:
+                st.error(str(error))
+            else:
+                st.session_state[auto_load_key] = "loaded"
+                st.success(f"{fixed_profile}（{fixed_mode}）を保存しました。")
+
+        if load_col.button(
+            "DBから再読み込み",
+            disabled=supabase_config() is None,
+            key=f"load_fixed_{fixed_mode}_{fixed_profile}_{slot_minutes}",
+        ):
+            try:
+                saved = load_fixed_schedule(fixed_mode, fixed_profile)
+                if saved is None:
+                    st.warning("この設定名には、まだ保存データがありません。")
+                elif int(saved["slot_minutes"]) != slot_minutes:
+                    st.error(
+                        f"保存データの勉強単位は{saved['slot_minutes']}分です。"
+                        f" サイドバーを{saved['slot_minutes']}分単位に変更してから読み込んでください。"
+                    )
+                else:
+                    grid_key, recovery_key = fixed_schedule_state_keys(
+                        fixed_mode, fixed_profile, slot_minutes
+                    )
+                    loaded_grid = saved["fixed_grid"]
+                    if len(loaded_grid) != DAYS_PER_WEEK or any(
+                        len(row) != slots_per_day(slot_minutes) for row in loaded_grid
+                    ):
+                        raise RuntimeError("保存データの固定時間形式が現在の設定と一致しません。")
+                    st.session_state[grid_key] = loaded_grid
+                    st.session_state[recovery_key] = saved.get("block_recoveries") or {}
+                    clear_fixed_editor_widget_state(fixed_mode, fixed_profile, slot_minutes)
+                    st.session_state[auto_load_key] = "loaded"
+                    st.rerun()
+            except RuntimeError as error:
+                st.error(str(error))
 
     params["fixed_grid"] = fixed_grid
     params["block_recoveries"] = block_recoveries
