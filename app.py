@@ -18,8 +18,11 @@ except ImportError:  # pragma: no cover
 
 
 DAYS_PER_WEEK = 7
-START_HOUR = 8
-END_HOUR = 22
+START_HOUR = 6
+END_HOUR = 24
+ACTIVE_START_HOUR = 8
+ACTIVE_END_HOUR = 21
+ACTIVE_END_MINUTE = 30
 WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
 UNIT_OPTIONS = {
     "1時間": 60,
@@ -263,12 +266,54 @@ def save_fixed_schedule(
 
 
 def default_fixed_slots(day_index: int, slot_minutes: int) -> set[int]:
-    fixed = set()
+    slots = slots_per_day(slot_minutes)
+    fixed = set(range(0, time_to_slot(ACTIVE_START_HOUR, 0, slot_minutes)))
+    fixed.update(range(time_to_slot(ACTIVE_END_HOUR, ACTIVE_END_MINUTE, slot_minutes), slots))
     weekday = day_index % 7
     if weekday < 5:
         fixed.update(range(time_to_slot(8, 30, slot_minutes), time_to_slot(15, 30, slot_minutes)))
     fixed.update(range(time_to_slot(18, 0, slot_minutes), time_to_slot(19, 0, slot_minutes)))
     return fixed
+
+
+def normalize_loaded_fixed_schedule(
+    saved: dict,
+    slot_minutes: int,
+) -> tuple[list[list[bool]], dict[str, int]]:
+    loaded_grid = saved["fixed_grid"]
+    if len(loaded_grid) != DAYS_PER_WEEK:
+        raise RuntimeError("保存データの曜日数が現在の設定と一致しません。")
+
+    current_slots = slots_per_day(slot_minutes)
+    if all(len(row) == current_slots for row in loaded_grid):
+        return loaded_grid, saved.get("block_recoveries") or {}
+
+    # 旧版（8:00–22:00）の保存データは、同じ時刻位置へ移し、
+    # 新しく追加した6:00–8:00と22:00–24:00を固定予定にする。
+    legacy_slots = 14 * 60 // slot_minutes
+    if not all(len(row) == legacy_slots for row in loaded_grid):
+        raise RuntimeError("保存データの固定時間形式が現在の設定と一致しません。")
+
+    offset = (8 - START_HOUR) * 60 // slot_minutes
+    migrated_grid = default_fixed_grid(slot_minutes)
+    for day_index, row in enumerate(loaded_grid):
+        migrated_grid[day_index][offset:offset + legacy_slots] = row
+        for slot in range(0, time_to_slot(ACTIVE_START_HOUR, 0, slot_minutes)):
+            migrated_grid[day_index][slot] = True
+        for slot in range(
+            time_to_slot(ACTIVE_END_HOUR, ACTIVE_END_MINUTE, slot_minutes),
+            current_slots,
+        ):
+            migrated_grid[day_index][slot] = True
+
+    migrated_recoveries = {}
+    for block_id, amount in (saved.get("block_recoveries") or {}).items():
+        try:
+            day, start, end = (int(value) for value in block_id.split(":"))
+        except (AttributeError, ValueError):
+            continue
+        migrated_recoveries[f"{day}:{start + offset}:{end + offset}"] = amount
+    return migrated_grid, migrated_recoveries
 
 
 def fixed_slots(day_index: int, slot_minutes: int, params: dict[str, float] | None = None) -> set[int]:
@@ -699,15 +744,16 @@ def render_schedule(schedule: list[dict], show_subjects: bool, slot_minutes: int
       .swatch.subj-science { background: #f2a541; }
       .swatch.subj-social { background: #d65f5f; }
       .axis-row { display: grid; grid-template-columns: 64px 1fr; gap: 8px; align-items: center; color: #666; }
-      .axis-track { display: grid; grid-template-columns: repeat(7, 1fr); font-variant-numeric: tabular-nums; }
+      .axis-track { display: grid; grid-template-columns: repeat(VAR_TICKS, 1fr); font-variant-numeric: tabular-nums; }
     </style>
     """.replace("VAR_SLOTS", str(slots)).replace("VAR_CELL_WIDTH", str(min_cell_width))
+    axis_hours = list(range(START_HOUR, END_HOUR, 3))
+    css = css.replace("VAR_TICKS", str(len(axis_hours)))
     html = [css, '<div class="schedule-wrap">']
     html.append(
         '<div class="axis-row"><div>時刻</div><div class="axis-track">'
-        "<span>8</span><span>10</span><span>12</span><span>14</span>"
-        "<span>16</span><span>18</span><span>20</span>"
-        "</div></div>"
+        + "".join(f"<span>{hour}</span>" for hour in axis_hours)
+        + "</div></div>"
     )
     for row in schedule:
         label = "1日" if len(schedule) == 1 else f"D{row['day']}({row['weekday']})"
@@ -1010,16 +1056,14 @@ def main() -> None:
                 elif int(saved["slot_minutes"]) != slot_minutes:
                     st.session_state[auto_load_key] = f"unit_mismatch:{saved['slot_minutes']}"
                 else:
-                    loaded_grid = saved["fixed_grid"]
-                    if len(loaded_grid) != DAYS_PER_WEEK or any(
-                        len(row) != slots_per_day(slot_minutes) for row in loaded_grid
-                    ):
-                        raise RuntimeError("保存データの固定時間形式が現在の設定と一致しません。")
+                    loaded_grid, loaded_recoveries = normalize_loaded_fixed_schedule(
+                        saved, slot_minutes
+                    )
                     grid_key, recovery_key = fixed_schedule_state_keys(
                         fixed_mode, fixed_profile, slot_minutes
                     )
                     st.session_state[grid_key] = loaded_grid
-                    st.session_state[recovery_key] = saved.get("block_recoveries") or {}
+                    st.session_state[recovery_key] = loaded_recoveries
                     clear_fixed_editor_widget_state(fixed_mode, fixed_profile, slot_minutes)
                     st.session_state[auto_load_key] = "loaded"
             except RuntimeError as error:
@@ -1088,13 +1132,11 @@ def main() -> None:
                     grid_key, recovery_key = fixed_schedule_state_keys(
                         fixed_mode, fixed_profile, slot_minutes
                     )
-                    loaded_grid = saved["fixed_grid"]
-                    if len(loaded_grid) != DAYS_PER_WEEK or any(
-                        len(row) != slots_per_day(slot_minutes) for row in loaded_grid
-                    ):
-                        raise RuntimeError("保存データの固定時間形式が現在の設定と一致しません。")
+                    loaded_grid, loaded_recoveries = normalize_loaded_fixed_schedule(
+                        saved, slot_minutes
+                    )
                     st.session_state[grid_key] = loaded_grid
-                    st.session_state[recovery_key] = saved.get("block_recoveries") or {}
+                    st.session_state[recovery_key] = loaded_recoveries
                     clear_fixed_editor_widget_state(fixed_mode, fixed_profile, slot_minutes)
                     st.session_state[auto_load_key] = "loaded"
                     st.rerun()
