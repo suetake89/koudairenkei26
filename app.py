@@ -105,7 +105,6 @@ FORMULA_BLOCKS = {
         requires=("allocation",),
         description="勉強すると下がり、休憩すると回復する状態を入れる。",
         formulas=(
-            r"M_t\in[0,100]",
             r"M_1=100",
             r"V_t=M_t-aZ_t+bR_t+G_t",
             r"V_t-\Omega Q_t\le M_{t+1}\le V_t",
@@ -435,13 +434,18 @@ def solve_schedule(enabled: set[str], params: dict[str, float]) -> tuple[list[di
             if "subjects" in enabled
             else params["a"]
         )
-        max_recovery = max(
-            [0, *(params.get("block_recoveries") or {}).values()]
+        recovery_values = list((params.get("block_recoveries") or {}).values())
+        max_positive_recovery = max([0, *recovery_values])
+        max_negative_recovery = max([0, *(-value for value in recovery_values)])
+        # M has no explicit lower bound.  Use a horizon-wide conservative
+        # bound so that negative G values are covered by both linearizations.
+        max_step_drop = max_decrease + max_negative_recovery
+        omega = max(
+            100,
+            slots * max_step_drop,
+            params["b"] + max_positive_recovery,
         )
-        # V is in [-max_decrease, 100 + b + max_recovery].  This value is
-        # large enough for both min(100, V) and W = MZ linearizations.
-        omega = max(100, 100 + max_decrease, params["b"] + max_recovery)
-        m = pulp.LpVariable.dicts("M", (range(days), range(slots)), 0, 100, cat="Continuous")
+        m = pulp.LpVariable.dicts("M", (range(days), range(slots)), cat="Continuous")
         w = pulp.LpVariable.dicts("W", (range(days), range(slots)), cat="Continuous")
         v = pulp.LpVariable.dicts("V", (range(days), range(slots - 1)), cat="Continuous")
         q = pulp.LpVariable.dicts("Q", (range(days), range(slots - 1)), 0, 1, cat="Binary")
@@ -651,7 +655,6 @@ def current_model_formulas(enabled: set[str]) -> list[tuple[str, list[FormulaLin
     ]
     if has_motivation:
         variables.extend([
-            (rf"{m}\in[0,100]\quad({idx})", "その時間のモチベーション。"),
             (rf"{w}\in\mathbb{{R}}\quad({idx})", "モチベーションを考慮した勉強の評価値。"),
             (r"Q_{dt}\in\{0,1\}" if is_week else r"Q_t\in\{0,1\}", "上限100を適用するかを表す補助変数。"),
             (r"\Omega>0", "線形化に用いる、十分大きなBig-M定数。"),
@@ -963,7 +966,7 @@ def render_fixed_time_editor(
             default = st.session_state[recovery_state_key].get(block["id"], 0)
             draft_recoveries[block["id"]] = st.number_input(
                 f"{block['label']} の回復量",
-                min_value=0,
+                min_value=-100,
                 value=int(default),
                 step=5,
                 key=f"recovery_input_{widget_suffix}_{block['id']}",
