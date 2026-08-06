@@ -78,12 +78,13 @@ FORMULA_BLOCKS = {
         priority=1,
         label="勉強・休憩・自由時間",
         requires=(),
-        description="固定予定以外の時間では、勉強か休憩のどちらかを選ぶ。",
+        description="固定予定以外の時間では勉強か休憩を選び、休憩は1コマずつ取る。",
         formulas=(
             r"T=\{1,\ldots,28\}",
             r"A_t\in\{0,1\}",
             r"Z_t,R_t\in\{0,1\}",
             r"Z_t+R_t=A_t\quad(t\in T)",
+            r"R_t+R_{t+1}\le1\quad(t=1,\ldots,|T|-1)",
             r"\max\sum_{t\in T}Z_t",
         ),
     ),
@@ -117,13 +118,14 @@ FORMULA_BLOCKS = {
     "week": FormulaBlock(
         key="week",
         priority=4,
-        label="7日間化",
+        label="7日間化・日別最低時間",
         requires=("allocation",),
-        description="1日モデルを月曜から日曜までの週間計画に広げる。",
+        description="週間計画に広げ、曜日ごとの最低勉強コマ数を設定する。",
         formulas=(
             r"D=\{1,\ldots,7\}",
             r"Z_{dt}+R_{dt}=A_{dt}\quad(d\in D,t\in T)",
             r"\sum_{d\in D}\sum_{t\in T}Z_{dt}\ge H",
+            r"\sum_{t\in T}Z_{dt}\ge H_d^{\mathrm{day}}\quad(d\in D)",
         ),
     ),
     "subjects": FormulaBlock(
@@ -404,6 +406,12 @@ def build_sample_schedule(enabled: set[str], params: dict[str, float] | None = N
                 if states[t] != "fixed":
                     states[t] = "study"
                     subjects[t] = SUBJECTS[(d + idx) % len(SUBJECTS)] if "subjects" in enabled else None
+        for t in range(1, slots):
+            if states[t - 1] == "rest" and states[t] == "rest":
+                states[t] = "study"
+                if "subjects" in enabled:
+                    next_subject = subjects[t + 1] if t + 1 < slots and states[t + 1] == "study" else None
+                    subjects[t] = next_subject or SUBJECTS[(d + t) % len(SUBJECTS)]
         rows.append({"day": d + 1, "weekday": WEEKDAYS[d % 7], "states": states, "subjects": subjects})
     return rows
 
@@ -456,6 +464,9 @@ def solve_schedule(enabled: set[str], params: dict[str, float]) -> tuple[list[di
                 model += w[d][t] <= m[d][t] + omega * (1 - z[d][t])
                 model += w[d][t] >= m[d][t] - omega * (1 - z[d][t])
 
+        for t in range(slots - 1):
+            model += r[d][t] + r[d][t + 1] <= 1
+
         if m is not None:
             model += m[d][0] == 100
 
@@ -487,7 +498,11 @@ def solve_schedule(enabled: set[str], params: dict[str, float]) -> tuple[list[di
                         <= 2 - z[d][t] - z[d][t + 1]
                     )
 
-    max_available = sum(slots - len(fixed_slots(d, slot_minutes, params)) for d in range(days))
+    available_by_day = [
+        slots - len(fixed_slots(d, slot_minutes, params))
+        for d in range(days)
+    ]
+    max_available = sum(available_by_day)
     if "required_study" in enabled and params["h_min"] > max_available:
         max_hours = max_available * slot_minutes / 60
         requested_hours = params["h_min"] * slot_minutes / 60
@@ -496,10 +511,37 @@ def solve_schedule(enabled: set[str], params: dict[str, float]) -> tuple[list[di
             f"PuLP の解が不可能です。勉強時間の下限が {requested_hours:.1f} 時間ですが、固定予定を除いた自由時間は最大 {max_hours:.1f} 時間です。",
         )
 
+    if "week" in enabled:
+        daily_h_min = params.get("daily_h_min", {})
+        for d in range(days):
+            requested = int(daily_h_min.get(d, 0))
+            if requested > available_by_day[d]:
+                requested_hours = requested * slot_minutes / 60
+                max_hours = available_by_day[d] * slot_minutes / 60
+                return (
+                    build_sample_schedule(enabled, params),
+                    f"PuLP の解が不可能です。{WEEKDAYS[d]}曜日の最低勉強時間は"
+                    f"{requested_hours:.1f}時間ですが、自由時間は最大{max_hours:.1f}時間です。",
+                )
+
+        if "required_study" in enabled and sum(daily_h_min.values()) > params["h_max"]:
+            return (
+                build_sample_schedule(enabled, params),
+                "PuLP の解が不可能です。曜日別最低勉強コマ数の合計が、"
+                "全期間の最大勉強コマ数を上回っています。",
+            )
+
     if "required_study" in enabled:
         study_total = pulp.lpSum(z[d][t] for d in range(days) for t in range(slots))
         model += study_total >= params["h_min"]
         model += study_total <= min(params["h_max"], max_available)
+
+    if "week" in enabled:
+        for d in range(days):
+            model += (
+                pulp.lpSum(z[d][t] for t in range(slots))
+                >= daily_h_min.get(d, 0)
+            )
 
     if x is not None and "subjects" in enabled:
         for subject in SUBJECTS:
@@ -629,8 +671,16 @@ def current_model_formulas(enabled: set[str]) -> list[tuple[str, list[FormulaLin
 
     constraints: list[tuple[str, list[FormulaLine]]] = []
     constraints.append((
-        "制約1：自由時間の割当て",
-        [(rf"{z}+{r_var}={a}\quad({idx})", "自由時間なら勉強か休憩、固定予定ならどちらもできない。")],
+        "制約1：自由時間の割当て・休憩の連続禁止",
+        [
+            (rf"{z}+{r_var}={a}\quad({idx})", "自由時間なら勉強か休憩、固定予定ならどちらもできない。"),
+            (
+                rf"{r_var}+{'R_{d,t+1}' if is_week else 'R_{t+1}'}\le1\quad("
+                + (r"d\in D,\ t<|T|" if is_week else r"t<|T|")
+                + ")",
+                "休憩を2コマ連続で取らず、1コマずつ取る。",
+            ),
+        ],
     ))
     if "required_study" in enabled:
         constraints.append((
@@ -654,8 +704,14 @@ def current_model_formulas(enabled: set[str]) -> list[tuple[str, list[FormulaLin
         ))
     if is_week:
         constraints.append((
-            "制約4：7日間化",
-            [(r"d\in D=\{1,\ldots,7\}", "1日モデルを月曜から日曜までに広げる。")],
+            "制約4：7日間化・日別最低時間",
+            [
+                (r"d\in D=\{1,\ldots,7\}", "1日モデルを月曜から日曜までに広げる。"),
+                (
+                    r"\sum_{t\in T}Z_{dt}\ge H_d^{\mathrm{day}}\quad(d\in D)",
+                    "曜日ごとに設定した最低勉強コマ数を確保する。",
+                ),
+            ],
         ))
     if has_subjects:
         constraints.append((
@@ -964,7 +1020,7 @@ def main() -> None:
             if not raw_enabled["motivation"]:
                 reset_steps_after("motivation")
         if raw_enabled.get("motivation", False):
-            raw_enabled["week"] = st.toggle("4. 7日間化 D", key="toggle_week")
+            raw_enabled["week"] = st.toggle("4. 7日間化・日別最低時間 D", key="toggle_week")
             if not raw_enabled["week"]:
                 reset_steps_after("week")
         if raw_enabled.get("week", False):
@@ -1001,9 +1057,23 @@ def main() -> None:
             )
         else:
             st.caption("Step 2 を入れると、勉強時間の下限・上限を指定できます。")
+
+        daily_h_min = {d: 0 for d in range(DAYS_PER_WEEK)}
+        if "week" in enabled:
+            with st.expander(f"曜日別最低勉強コマ数（{unit_label}）", expanded=True):
+                for d, weekday in enumerate(WEEKDAYS):
+                    daily_h_min[d] = st.number_input(
+                        f"{weekday}曜日の最低勉強コマ数",
+                        min_value=0,
+                        max_value=slots_per_day(slot_minutes),
+                        value=0,
+                        step=1,
+                        key=f"daily_h_min_{slot_minutes}_{d}",
+                    )
         params = {
             "h_min": h_min,
             "h_max": h_max,
+            "daily_h_min": daily_h_min,
             "slot_minutes": slot_minutes,
             "a": 20,
             "b": 30,
@@ -1181,6 +1251,15 @@ def main() -> None:
             if "required_study" in enabled:
                 parameter_rows.append({"項目": "最低勉強コマ数", "記号": "H^{min}", "値": f"{h_min} コマ"})
                 parameter_rows.append({"項目": "最大勉強コマ数", "記号": "H^{max}", "値": f"{h_max} コマ"})
+            if "week" in enabled:
+                for d, weekday in enumerate(WEEKDAYS):
+                    parameter_rows.append(
+                        {
+                            "項目": f"{weekday}曜日の最低勉強コマ数",
+                            "記号": f"H_{{{d + 1}}}^{{day}}",
+                            "値": f"{params['daily_h_min'][d]} コマ",
+                        }
+                    )
             if "subjects" in enabled:
                 for subject in SUBJECTS:
                     parameter_rows.append(
